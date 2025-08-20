@@ -1,5 +1,5 @@
-from interface.chat_controller import start_chat
+def main():
+    print("Cryptobot MVP scaffolding ready. Next step will add collector, analyzer, storage, and dashboard.")
 
 if __name__ == "__main__":
-    print("🚀 Launching PepeAI v2...")
-    start_chat()
+    main()

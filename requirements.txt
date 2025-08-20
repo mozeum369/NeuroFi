@@ -1,0 +1,23 @@
+# Core
+numpy==2.1.1
+pandas==2.2.2
+python-dotenv==1.0.1
+
+# HTTP + parsing
+httpx==0.27.2
+feedparser==6.0.11
+beautifulsoup4==4.12.3
+lxml==5.3.0
+langdetect==1.0.9
+
+# Scheduling (optional if we stick with pure asyncio)
+APScheduler==3.10.4
+
+# Dashboard
+plotly==5.23.0
+dash==2.17.1
+dash-bootstrap-components==1.6.0
+
+# Dev
+typer==0.12.3
+rich==13.8.0
