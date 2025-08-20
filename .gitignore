@@ -1,27 +1,7 @@
-# Python
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-*.so
 *.egg-info/
-.env
-*.env
-
-# Virtual environments
 .venv/
-venv/
-ENV/
-
-# IDE/editor
-.vscode/
-.idea/
-
-# OS
+.env
 .DS_Store
-
-# Data/cache/logs
-data/
-logs/
-cache/
-*.db
+logs/*.log
