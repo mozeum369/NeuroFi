@@ -1,0 +1,60 @@
+{
+  "predictions": [
+    {
+      "headline": "Pepe surges after meme revival",
+      "mentions": [
+        "pepe"
+      ],
+      "polarity": 0.0,
+      "subjectivity": 0.0,
+      "prediction": "HOLD",
+      "outcome": false,
+      "correct": true
+    },
+    {
+      "headline": "Zora announces new NFT marketplace",
+      "mentions": [
+        "zora"
+      ],
+      "polarity": 0.13636363636363635,
+      "subjectivity": 0.45454545454545453,
+      "prediction": "BUY",
+      "outcome": false,
+      "correct": false
+    },
+    {
+      "headline": "Spell token sees unusual volume spike",
+      "mentions": [
+        "spell"
+      ],
+      "polarity": 0.2,
+      "subjectivity": 1.0,
+      "prediction": "BUY",
+      "outcome": false,
+      "correct": false
+    },
+    {
+      "headline": "Loopring integrates with major exchange",
+      "mentions": [],
+      "polarity": 0.0625,
+      "subjectivity": 0.5,
+      "prediction": "HOLD",
+      "outcome": false,
+      "correct": true
+    },
+    {
+      "headline": "Townes gains traction in DeFi circles",
+      "mentions": [
+        "townes"
+      ],
+      "polarity": 0.0,
+      "subjectivity": 0.0,
+      "prediction": "HOLD",
+      "outcome": false,
+      "correct": true
+    }
+  ],
+  "accuracy": 0.6,
+  "total": 5,
+  "correct": 3
+}
