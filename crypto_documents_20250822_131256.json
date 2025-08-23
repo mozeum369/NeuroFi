@@ -1,0 +1,62 @@
+[
+  {
+    "text": "Bitcoin is a decentralized digital currency without a central bank or single administrator.",
+    "source": "Wikipedia",
+    "category": "Currency",
+    "cleaned_text": "bitcoin is a decentralized digital currency without a central bank or single administrator"
+  },
+  {
+    "text": "Ethereum introduced smart contracts and decentralized applications (dApps).",
+    "source": "Ethereum.org",
+    "category": "Smart Contracts",
+    "cleaned_text": "ethereum introduced smart contracts and decentralized applications dapps"
+  },
+  {
+    "text": "Solana is a high-performance blockchain supporting fast transactions and low fees.",
+    "source": "Solana.com",
+    "category": "Blockchain",
+    "cleaned_text": "solana is a highperformance blockchain supporting fast transactions and low fees"
+  },
+  {
+    "text": "DeFi (Decentralized Finance) enables financial services without intermediaries.",
+    "source": "Investopedia",
+    "category": "Finance",
+    "cleaned_text": "defi decentralized finance enables financial services without intermediaries"
+  },
+  {
+    "text": "NFTs (Non-Fungible Tokens) represent ownership of unique digital assets on the blockchain.",
+    "source": "OpenSea",
+    "category": "Digital Assets",
+    "cleaned_text": "nfts nonfungible tokens represent ownership of unique digital assets on the blockchain"
+  },
+  {
+    "text": "Blockchain ETL datasets provide structured access to historical transaction data.",
+    "source": "Google Cloud",
+    "category": "Data",
+    "cleaned_text": "blockchain etl datasets provide structured access to historical transaction data"
+  },
+  {
+    "text": "AWS public blockchain data includes compressed datasets for Bitcoin, Ethereum, and more.",
+    "source": "AWS",
+    "category": "Data",
+    "cleaned_text": "aws public blockchain data includes compressed datasets for bitcoin ethereum and more"
+  },
+  {
+    "text": "Crypto Chain University archives academic research on blockchain and fintech.",
+    "source": "Crypto Chain University",
+    "category": "Research",
+    "cleaned_text": "crypto chain university archives academic research on blockchain and fintech"
+  },
+  {
+    "text": "AllCryptoWhitepapers.com hosts thousands of whitepapers from crypto projects.",
+    "source": "AllCryptoWhitepapers.com",
+    "category": "Whitepapers",
+    "cleaned_text": "allcryptowhitepaperscom hosts thousands of whitepapers from crypto projects"
+  },
+  {
+    "text": "GitHub best-of-crypto lists top open-source blockchain projects across categories.",
+    "source": "GitHub",
+    "category": "Open Source",
+    "cleaned_text": "github bestofcrypto lists top opensource blockchain projects across categories"
+  }
+]
