@@ -1,0 +1,8 @@
+# render.yaml
+services:
+  - type: worker
+    name: neurofi-sweeper
+    env: python
+    buildCommand: ""
+    startCommand: python src/neurofi/ingestion/coinbase_sweeper.py
+    autoDeploy: true
