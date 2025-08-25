@@ -1,22 +1,51 @@
-#!/usr/bin/env python3
-import argparse
+# Cryptobot.py
+import time
+import logging
+import traceback
+from ingestion import run_ingestion_pipeline
+from sentiment import run_sentiment_analysis
+from utils import analyze_market_patterns  # hypothetical utility
 
-def main():
-    parser = argparse.ArgumentParser(prog="Cryptobot", description="Cryptobot Command Line Interface")
-    sub = parser.add_subparsers(dest="cmd")
+# Setup logging
+logging.basicConfig(
+    filename='bot_log.json',
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s: %(message)s'
+)
 
-    sub.add_parser("start", help="Start the Cryptobot engine")
-    sub.add_parser("dashboard", help="Launch the Cryptobot dashboard")
+def main_loop():
+    retry_delay = 5  # initial delay in seconds
+    max_delay = 300  # max delay of 5 minutes
 
-    args = parser.parse_args()
+    while True:
+        try:
+            logging.info("🔁 Starting new analysis cycle...")
 
-    if args.cmd == "start":
-        from src.bot import run_bot
-        run_bot()
+            # Step 1: Ingest new data
+            run_ingestion_pipeline()
 
-    elif args.cmd == "dashboard":
-        from src.dashboard import run_dashboard
-        run_dashboard()
+            # Step 2: Run sentiment analysis
+            run_sentiment_analysis()
+
+            # Step 3: Analyze patterns and make predictions
+            analyze_market_patterns()
+
+            logging.info("✅ Cycle completed successfully.")
+            retry_delay = 5  # reset delay after success
+
+            # Wait before next cycle
+            time.sleep(60)
+
+        except Exception as e:
+            logging.error("❌ Error in bot cycle: %s", str(e))
+            logging.error(traceback.format_exc())
+
+            logging.info(f"Retrying in {retry_delay} seconds...")
+            time.sleep(retry_delay)
+
+            # Exponential backoff
+            retry_delay = min(retry_delay * 2, max_delay)
 
 if __name__ == "__main__":
-    main()
+    logging.info("🚀 Cryptobot started.")
+    main_loop()
