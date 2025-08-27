@@ -1,8 +1,14 @@
-# render.yaml
 services:
-  - type: worker
-    name: neurofi-sweeper
+  - type: web
+    name: neurofi-dashboard
     env: python
-    buildCommand: ""
-    startCommand: python src/neurofi/ingestion/coinbase_sweeper.py
+    buildCommand: pip install -r requirements.txt
+    startCommand: bash start.sh
+    autoDeploy: true
+
+  - type: worker
+    name: neurofi-bot-worker
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python Cryptobot.py
     autoDeploy: true
