@@ -6,3 +6,17 @@ __pycache__/
 .DS_Store
 logs/*.log
 .env
+# secrets
+.env
+*.pem
+*private_key*
+*credentials*
+coinbase_sweep.json
+# caches & noise
+__pycache__/
+*.ipynb_checkpoints/
+data/
+logs/
+node_modules/
+*.faiss
+*.tmp
