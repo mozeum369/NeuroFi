@@ -1,370 +1,232 @@
-import importlib.util
+# NeuroFi/ai_core/agent.py
+# Cryptobot main loop with structured logs, retries, and graceful shutdown
+
+import argparse
 import json
-import os
+import logging
 import random
-import re
-import shutil
-import subprocess
+import signal
 import sys
-import textwrap
-from dataclasses import dataclass
-from datetime import datetime
+import time
+import traceback
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Callable, Any, Dict
+from threading import Event
 
-# ============================================================
-# SelfModifyingAgent
-# Sandboxed, controlled self-modification + skill evolution
-# ============================================================
+# ==== Imports (prefer package imports; fallback for script mode) ====
+try:
+    # When running as a package: python -m ai_core.agent
+    from ai_core.ingestion import run_ingestion_pipeline
+    from ai_core.sentiment import run_sentiment_analysis
+    from ai_core.utils import analyze_market_patterns  # adjust if located elsewhere
+except ModuleNotFoundError:
+    # Fallback when running directly from repo root without installing as a package
+    repo_root = Path(__file__).resolve().parents[1]  # .../NeuroFi
+    sys.path.append(str(repo_root / "ai_core"))
+    from ingestion import run_ingestion_pipeline
+    from sentiment import run_sentiment_analysis
+    from utils import analyze_market_patterns  # adjust to actual module
 
-@dataclass
-class AgentConfig:
-    allowed_dirs: List[str]
-    max_children_per_generation: int = 4
-    mutation_offsets: Tuple[int, ...] = (-2, -1, 1, 2)
-    registry_path: str = "state/registry.json"
-    events_log: str = "logs/events.jsonl"
-    metrics_path: str = "state/metrics.json"
-    experiments_dir: str = "experiments"
-    skills_dir: str = "skills"
-    heartbeat_block_begin: str = "# <HEARTBEAT>"
-    heartbeat_block_end: str = "# </HEARTBEAT>"
+# ==== Paths ====
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+LOG_DIR = PROJECT_ROOT / "logs"
+STATUS_DIR = PROJECT_ROOT / "status"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+STATUS_DIR.mkdir(parents=True, exist_ok=True)
+LOG_PATH = LOG_DIR / "bot_log.json"
+HEALTH_PATH = STATUS_DIR / "health.json"
 
-class SelfModifyingAgent:
-    def __init__(self, project_root: Path, name: str = "SelfModAI"):
-        self.name = name
-        self.root = project_root
-        self.cfg = AgentConfig(
-            allowed_dirs=[
-                str(self.root / "skills"),
-                str(self.root / "state"),
-                str(self.root / "logs"),
-                str(self.root / "experiments"),
-            ]
-        )
-        self.paths = {
-            "skills": self.root / self.cfg.skills_dir,
-            "state": self.root / "state",
-            "logs": self.root / "logs",
-            "experiments": self.root / self.cfg.experiments_dir,
-            "registry": self.root / self.cfg.registry_path,
-            "events_log": self.root / self.cfg.events_log,
-            "metrics": self.root / self.cfg.metrics_path,
+# ==== Structured JSON logging ====
+class JSONFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        # Base payload
+        payload: Dict[str, Any] = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(record.created)),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
         }
+        # Include extras if present
+        for attr in ("cycle_id", "step", "duration_s", "attempt", "max_attempts"):
+            if hasattr(record, attr):
+                payload[attr] = getattr(record, attr)
+        # Exception info
+        if record.exc_info:
+            payload["exc_type"] = record.exc_info[0].__name__
+            payload["exc"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=False)
 
-        self.generation = 0
-        self._ensure_dirs()
-        self._ensure_registry()
+def get_logger() -> logging.Logger:
+    logger = logging.getLogger("cryptobot")
+    logger.setLevel(logging.INFO)
+    # Avoid duplicate handlers in interactive sessions
+    if logger.handlers:
+        return logger
+    handler = RotatingFileHandler(
+        LOG_PATH,
+        maxBytes=5 * 1024 * 1024,  # 5 MB
+        backupCount=5,
+        encoding="utf-8",
+    )
+    handler.setFormatter(JSONFormatter())
+    logger.addHandler(handler)
 
-    # ---------------------- Bootstrap & Dirs ----------------------
-    def _ensure_dirs(self):
-        for p in self.paths.values():
-            if isinstance(p, Path) and p.suffix == "":
-                p.mkdir(parents=True, exist_ok=True)
-        (self.root / self.cfg.skills_dir).mkdir(parents=True, exist_ok=True)
+    # Also log a minimal line to console for operator visibility
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(logging.INFO)
+    console.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+    logger.addHandler(console)
+    return logger
 
-    def _ensure_registry(self):
-        if not self.paths["registry"].exists():
-            data = {
-                "created_at": datetime.utcnow().isoformat(),
-                "agent": self.name,
-                "best_skill": None,
-                "skills": {},
-                "history": [],
-                "generation": 0,
-            }
-            self._safe_write_json(self.paths["registry"], data)
+logger = get_logger()
 
-    def bootstrap(self):
-        registry = self._load_registry()
-        if not registry["skills"]:
-            # Create an initial MA skill with window 5
-            base_name = "ma_w5"
-            code = self._make_ma_skill_code(window=5)
-            path = self._write_skill(base_name, code)
-            score = self._evaluate_skill(base_name)
-            registry["skills"][base_name] = {
-                "path": str(path),
-                "created_at": datetime.utcnow().isoformat(),
-                "score": score,
-            }
-            registry["best_skill"] = base_name
-            registry["generation"] = 0
-            self._save_registry(registry)
-            self._log_event("bootstrap", {"skill": base_name, "score": score})
+# ==== Utilities ====
+def write_health(status: Dict[str, Any]) -> None:
+    try:
+        HEALTH_PATH.write_text(json.dumps(status, indent=2))
+    except Exception:
+        logger.exception("Failed to write health file")
 
-    # ---------------------- Evolution Loop -----------------------
-    def evolve_once(self) -> Dict[str, Any]:
-        registry = self._load_registry()
-        parent = registry["best_skill"]
-        if parent is None:
-            self.bootstrap()
-            registry = self._load_registry()
-            parent = registry["best_skill"]
+def jittered_backoff(base: float, factor: float, attempt: int, max_delay: float) -> float:
+    # backoff = min(base * (factor ** (attempt-1)), max_delay) ± 20% jitter
+    delay = min(base * (factor ** max(0, attempt - 1)), max_delay)
+    jitter = delay * random.uniform(-0.2, 0.2)
+    return max(0.5, delay + jitter)
 
-        parent_score = registry["skills"][parent]["score"]
-
-        # Propose children via mutation
-        children: List[Tuple[str, float]] = []
-        parent_w = self._extract_window_from_name(parent)
-
-        offsets = list(self.cfg.mutation_offsets)
-        random.shuffle(offsets)
-        offsets = offsets[: self.cfg.max_children_per_generation]
-
-        for off in offsets:
-            new_w = max(2, parent_w + off)  # keep window >= 2
-            child_name = f"ma_w{new_w}"
-            if child_name in registry["skills"]:
-                # already exists; just re-evaluate
-                score = self._evaluate_skill(child_name)
-            else:
-                code = self._make_ma_skill_code(window=new_w)
-                self._write_skill(child_name, code)
-                score = self._evaluate_skill(child_name)
-
-            children.append((child_name, score))
-
-        # Decide best among parent + children (lower score is better)
-        candidates = [(parent, parent_score)] + children
-        best_child, best_score = min(candidates, key=lambda kv: kv[1])
-
-        # Update registry
-        for name, score in candidates:
-            srec = registry["skills"].get(name, None)
-            if srec is None:
-                registry["skills"][name] = {
-                    "path": str(self._skill_path(name)),
-                    "created_at": datetime.utcnow().isoformat(),
-                    "score": score,
-                }
-            else:
-                # keep best observed score
-                srec["score"] = min(srec.get("score", float("inf")), score)
-
-        registry["best_skill"] = best_child
-        registry["generation"] = registry.get("generation", 0) + 1
-        self._save_registry(registry)
-
-        self.generation = registry["generation"]
-        self._log_event(
-            "evolve",
-            {
-                "generation": self.generation,
-                "parent": parent,
-                "parent_score": parent_score,
-                "candidates": candidates,
-                "best": best_child,
-                "best_score": best_score,
-            },
-        )
-        self._update_metrics(best=best_child, score=best_score)
-
-        return {
-            "generation": self.generation,
-            "best_skill": best_child,
-            "best_score": best_score,
-        }
-
-    # ---------------------- Skill Creation -----------------------
-    def _make_ma_skill_code(self, window: int) -> str:
-        # Simple moving-average predictor skill
-        return textwrap.dedent(
-            f"""
-            \"\"\"Auto-generated skill: Moving Average predictor (window={window})\"\"\"
-
-            METADATA = {{
-                "name": "ma_w{window}",
-                "type": "moving_average",
-                "window": {window}
-            }}
-
-            def predict(series):
-                \"\"\"
-                Predict next values using simple moving average with fixed window.
-                Input: list[float] series
-                Output: list[float] predictions (same length; first window elements are repeated first observed value)
-                \"\"\"
-                if not series:
-                    return []
-                w = {window}
-                n = len(series)
-                preds = []
-                runsum = 0.0
-                for i, x in enumerate(series):
-                    runsum += x
-                    if i >= w:
-                        runsum -= series[i - w]
-                    if i < w - 1:
-                        preds.append(series[0])
-                    else:
-                        # average of last w elements including current
-                        start = i - w + 1
-                        s = 0.0
-                        for j in range(start, i + 1):
-                            s += series[j]
-                        preds.append(s / w)
-                return preds
-            """
-        ).strip() + "\n"
-
-    def _write_skill(self, name: str, code: str) -> Path:
-        path = self._skill_path(name)
-        self._safe_write_text(path, code)
-        return path
-
-    def _skill_path(self, name: str) -> Path:
-        return self.paths["skills"] / f"{name}.py"
-
-    def _extract_window_from_name(self, name: str) -> int:
-        m = re.search(r"ma_w(\\d+)", name)
-        if not m:
-            return 5
-        return int(m.group(1))
-
-    # ---------------------- Evaluation ---------------------------
-    def _evaluate_skill(self, name: str) -> float:
-        """
-        Returns a loss score (lower is better).
-        Uses synthetic dataset for reproducibility.
-        """
-        module = self._load_module(name, self._skill_path(name))
-        series = self._make_synthetic_series(seed=42, length=200)
-        preds = module.predict(series)
-
-        # Mean Absolute Percentage Error (MAPE)-like metric
-        eps = 1e-8
-        total = 0.0
-        count = 0
-        for y, yhat in zip(series, preds):
-            denom = max(eps, abs(y))
-            total += abs(y - yhat) / denom
-            count += 1
-        score = total / max(1, count)
-        return float(score)
-
-    def _make_synthetic_series(self, seed: int, length: int) -> List[float]:
-        random.seed(seed)
-        # Trend + seasonality + noise
-        series = []
-        for t in range(length):
-            trend = 0.01 * t
-            season = 0.5 * (1 + __import__("math").sin(2 * __import__("math").pi * t / 24))
-            noise = random.gauss(0, 0.05)
-            series.append(1.0 + trend + season + noise)
-        return series
-
-    def _load_module(self, name: str, path: Path):
-        spec = importlib.util.spec_from_file_location(name, str(path))
-        if spec is None or spec.loader is None:
-            raise ImportError(f"Cannot load module: {name} from {path}")
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[name] = mod
-        spec.loader.exec_module(mod)
-        return mod
-
-    # ----------------- Controlled Self-Modification --------------
-    def self_edit_heartbeat(self, note: str = ""):
-        """
-        Safely updates the HEARTBEAT block in THIS FILE with current best-skill info.
-        Demonstrates self-modifying code without touching logic.
-        """
-        this_path = Path(__file__).resolve()
-        text = this_path.read_text(encoding="utf-8")
-
-        registry = self._load_registry()
-        best = registry.get("best_skill")
-        best_score = None
-        if best:
-            best_score = registry["skills"][best]["score"]
-
-        stamp = datetime.utcnow().isoformat()
-        payload = textwrap.dedent(
-            f"""
-            {self.cfg.heartbeat_block_begin}
-            name: {self.name}
-            timestamp_utc: {stamp}
-            generation: {registry.get('generation', 0)}
-            best_skill: {best}
-            best_score: {best_score}
-            note: {note}
-            {self.cfg.heartbeat_block_end}
-            """
-        ).strip()
-
-        # Replace or insert the block
-        begin = self.cfg.heartbeat_block_begin
-        end = self.cfg.heartbeat_block_end
-        block_re = re.compile(
-            rf"{re.escape(begin)}[\\s\\S]*?{re.escape(end)}", re.MULTILINE
-        )
-
-        if block_re.search(text):
-            new_text = block_re.sub(payload, text)
-        else:
-            new_text = text + "\n\n" + payload + "\n"
-
-        # Write back (self-modification!)
-        this_path.write_text(new_text, encoding="utf-8")
-        self._log_event("self_edit", {"file": str(this_path), "action": "heartbeat_update"})
-
-    # ---------------------- Logging & State ----------------------
-    def _load_registry(self) -> Dict[str, Any]:
-        return self._safe_read_json(self.paths["registry"])
-
-    def _save_registry(self, data: Dict[str, Any]):
-        self._safe_write_json(self.paths["registry"], data)
-
-    def _update_metrics(self, best: str, score: float):
-        metrics = {"updated_at": datetime.utcnow().isoformat(), "best_skill": best, "best_score": score}
-        self._safe_write_json(self.paths["metrics"], metrics)
-
-    def _log_event(self, event: str, payload: Dict[str, Any]):
-        rec = {
-            "ts": datetime.utcnow().isoformat(),
-            "event": event,
-            "payload": payload,
-        }
-        with self.paths["events_log"].open("a", encoding="utf-8") as f:
-            f.write(json.dumps(rec) + "\n")
-
-    # ---------------------- Safe I/O -----------------------------
-    def _safe_path(self, p: Path) -> Path:
-        p = p.resolve()
-        allowed = any(str(p).startswith(d) for d in self.cfg.allowed_dirs)
-        if not allowed:
-            raise PermissionError(f"Write access denied outside sandbox: {p}")
-        return p
-
-    def _safe_write_text(self, path: Path, text: str):
-        path = self._safe_path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
-
-    def _safe_read_json(self, path: Path) -> Dict[str, Any]:
-        if not path.exists():
-            return {}
-        with path.open("r", encoding="utf-8") as f:
-            return json.load(f)
-
-    def _safe_write_json(self, path: Path, data: Dict[str, Any]):
-        path = self._safe_path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
-        tmp.replace(path)
-
-    # ---------------------- Git (Optional) -----------------------
-    def git_autocommit(self, message: str = "autocommit"):
-        git = shutil.which("git")
-        if not git:
-            return
+def run_step(name: str, func: Callable[[], Any], cycle_id: int,
+             max_attempts: int = 3, base_delay: float = 2.0, factor: float = 2.0) -> Any:
+    """Run a single step with local retries so transient failures don't abort the whole cycle."""
+    attempt = 0
+    while True:
+        attempt += 1
+        t0 = time.monotonic()
         try:
-            subprocess.run([git, "add", "-A"], cwd=str(self.root), check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            subprocess.run([git, "commit", "-m", message], cwd=str(self.root), check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        except Exception as e:
-            self._log_event("git_error", {"error": str(e)})
+            logger.info(
+                f"▶️  Step start: {name}",
+                extra={"cycle_id": cycle_id, "step": name, "attempt": attempt, "max_attempts": max_attempts},
+            )
+            result = func()
+            dt = round(time.monotonic() - t0, 3)
+            logger.info(
+                f"✅ Step success: {name} ({dt}s)",
+                extra={"cycle_id": cycle_id, "step": name, "duration_s": dt, "attempt": attempt, "max_attempts": max_attempts},
+            )
+            return result
+        except Exception:
+            dt = round(time.monotonic() - t0, 3)
+            logger.exception(
+                f"❌ Step failed: {name} ({dt}s)",
+                extra={"cycle_id": cycle_id, "step": name, "duration_s": dt, "attempt": attempt, "max_attempts": max_attempts},
+            )
+            if attempt >= max_attempts:
+                raise
+            delay = jittered_backoff(base_delay, factor, attempt, max_delay=60)
+            logger.info(
+                f"↩️  Retrying step '{name}' in {round(delay,2)}s",
+                extra={"cycle_id": cycle_id, "step": name, "attempt": attempt, "max_attempts": max_attempts},
+            )
+            time.sleep(delay)
 
-# <HEARTBEAT>
-# (Populated at runtime)
-# </HEARTBEAT>
+def main_loop(interval_s: int = 60, max_cycle_delay: int = 300, stop_event: Event | None = None):
+    """
+    interval_s: desired time between cycle starts.
+    max_cycle_delay: cap for cycle-level exponential backoff after an unhandled error.
+    """
+    if stop_event is None:
+        stop_event = Event()
+
+    cycle_id = 0
+    cycle_backoff_base = 5.0
+    cycle_backoff_factor = 2.0
+    cycle_backoff_attempt = 0
+    logger.info("🚀 Cryptobot started.")
+    write_health({"status": "starting", "last_success_ts": None, "last_error": None})
+
+    while not stop_event.is_set():
+        cycle_id += 1
+        cycle_start_wall = time.time()
+        cycle_start = time.monotonic()
+        logger.info("🔁 Starting analysis cycle...", extra={"cycle_id": cycle_id})
+
+        try:
+            # --- Step 1: Ingest new data ---
+            run_step("ingestion", run_ingestion_pipeline, cycle_id)
+
+            # --- Step 2: Sentiment analysis ---
+            run_step("sentiment", run_sentiment_analysis, cycle_id)
+
+            # --- Step 3: Analyze patterns & predictions ---
+            run_step("pattern_analysis", analyze_market_patterns, cycle_id)
+
+            # Success housekeeping
+            cycle_backoff_attempt = 0
+            total_dt = round(time.monotonic() - cycle_start, 3)
+            logger.info("🏁 Cycle completed successfully.", extra={"cycle_id": cycle_id, "duration_s": total_dt})
+            write_health({
+                "status": "ok",
+                "last_success_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(cycle_start_wall)),
+                "last_error": None,
+                "last_cycle_duration_s": total_dt,
+                "cycle_id": cycle_id,
+            })
+
+            # Sleep until next scheduled start (fixed-rate schedule)
+            next_start = cycle_start + interval_s
+            sleep_for = max(0.0, next_start - time.monotonic())
+            if stop_event.wait(timeout=sleep_for):
+                break
+
+        except Exception:
+            # Cycle-level failure (after step retries exhausted)
+            cycle_backoff_attempt += 1
+            total_dt = round(time.monotonic() - cycle_start, 3)
+            exc_text = traceback.format_exc()
+            logger.error(
+                "‼️  Error in bot cycle",
+                extra={"cycle_id": cycle_id, "duration_s": total_dt},
+                exc_info=True
+            )
+            write_health({
+                "status": "degraded",
+                "last_success_ts": None,
+                "last_error": {"cycle_id": cycle_id, "traceback": exc_text},
+                "last_cycle_duration_s": total_dt,
+            })
+            delay = jittered_backoff(cycle_backoff_base, cycle_backoff_factor, cycle_backoff_attempt, max_delay=max_cycle_delay)
+            logger.info(f"⏳ Retrying cycle in {round(delay,2)} seconds...", extra={"cycle_id": cycle_id})
+            if stop_event.wait(timeout=delay):
+                break
+
+    logger.info("🛑 Cryptobot stopped.")
+    write_health({"status": "stopped", "last_success_ts": None, "last_error": None})
+
+def _install_signal_handlers(stop_event: Event):
+    def _handler(signum, _frame):
+        logger.info(f"Signal received ({signum}). Shutting down gracefully...")
+        stop_event.set()
+    signal.signal(signal.SIGINT, _handler)   # Ctrl+C
+    signal.signal(signal.SIGTERM, _handler)  # Termination (systemd/Docker/K8s)
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="NeuroFi Cryptobot loop")
+    p.add_argument("--interval", type=int, default=60, help="Seconds between cycle starts (default: 60)")
+    p.add_argument("--max-delay", type=int, default=300, help="Max cycle backoff delay in seconds (default: 300)")
+    p.add_argument("--once", action="store_true", help="Run a single cycle and exit")
+    return p.parse_args()
+
+def run_once():
+    # For quick local testing
+    stop = Event()
+    _install_signal_handlers(stop)
+    # Make interval large enough so we exit after one cycle
+    main_loop(interval_s=3600, max_cycle_delay=300, stop_event=stop)
+
+if __name__ == "__main__":
+    args = parse_args()
+    stop_event = Event()
+    _install_signal_handlers(stop_event)
+    if args.once:
+        run_once()
+    else:
+        main_loop(interval_s=args.interval, max_cycle_delay=args.max_delay, stop_event=stop_event)
