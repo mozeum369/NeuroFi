@@ -1,4 +1,4 @@
-# NeuroFi/ai_core/agent.py
+# NeuroFi/src/ai_core/agent.py
 # Cryptobot main loop with structured logs, retries, and graceful shutdown
 
 import argparse
@@ -14,19 +14,22 @@ from pathlib import Path
 from typing import Callable, Any, Dict
 from threading import Event
 
-# ==== Imports (prefer package imports; fallback for script mode) ====
+# ==== Imports (prefer package imports; fallback for script mode with src/) ====
 try:
-    # When running as a package: python -m ai_core.agent
+    # When installed or run as a module: python -m ai_core.agent
     from ai_core.ingestion import run_ingestion_pipeline
     from ai_core.sentiment import run_sentiment_analysis
-    from ai_core.utils import analyze_market_patterns  # adjust if located elsewhere
+    from ai_core.utils import analyze_market_patterns
+    from ai_core.paths import LOG_DIR
 except ModuleNotFoundError:
-    # Fallback when running directly from repo root without installing as a package
-    repo_root = Path(__file__).resolve().parents[1]  # .../NeuroFi
-    sys.path.append(str(repo_root / "ai_core"))
-    from ingestion import run_ingestion_pipeline
-    from sentiment import run_sentiment_analysis
-    from utils import analyze_market_patterns  # adjust to actual module
+    # Fallback when running directly from repo root without installing
+    # Assumes this file lives at: .../NeuroFi/src/ai_core/agent.py
+    repo_root = Path(__file__).resolve().parents[2]  # .../NeuroFi
+    sys.path.insert(0, str(repo_root / "src"))
+    from ai_core.ingestion import run_ingestion_pipeline
+    from ai_core.sentiment import run_sentiment_analysis
+    from ai_core.utils import analyze_market_patterns
+    from ai_core.paths import LOG_DIR
 
 # ==== Paths ====
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
