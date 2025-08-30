@@ -1,22 +1,21 @@
-__pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
-.env
-.DS_Store
-logs/*.log
-.env
-# secrets
-.env
-*.pem
-*private_key*
-*credentials*
-coinbase_sweep.json
-# caches & noise
-__pycache__/
-*.ipynb_checkpoints/
-data/
+# Create or append to .gitignore
+cat >> .gitignore << 'EOF'
+# NeuroFi runtime artifacts
+signals/
+reports/
 logs/
-node_modules/
-*.faiss
-*.tmp
+*.log
+
+# Python build/run noise
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Local env files
+.env
+.env.*
+EOF
