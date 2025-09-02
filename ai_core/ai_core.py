@@ -1,1 +1,0 @@
-/home/mozeum/NeuroFi/.cache/ai_core/ai_core.tmp

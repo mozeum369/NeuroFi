@@ -1,1 +1,0 @@
-/home/mozeum/NeuroFi/src/bot/Cryptobot.py
