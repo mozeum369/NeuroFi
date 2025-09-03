@@ -1,235 +1,120 @@
-# NeuroFi/src/ai_core/agent.py
-# Cryptobot main loop with structured logs, retries, and graceful shutdown
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import argparse
 import json
 import logging
-import random
-import signal
-import sys
 import time
-import traceback
-from logging.handlers import RotatingFileHandler
-from pathlib import Path
-from typing import Callable, Any, Dict
-from threading import Event
+import asyncio
+from ai_core import (
+    get_next_pending_goal,
+    update_goal_status,
+    log_strategy_performance,
+)
+from strategy_selector import pool as strategy_pool
+from crawler import gather_data_for_goal
+from onchain_scraper import gather_onchain_data_for_goal
+from ws_listener import WebSocketListener
 
-# ==== Imports (prefer package imports; fallback for script mode with src/) ====
-try:
-    # When installed or run as a module: python -m ai_core.agent
-    from ai_core.ingestion import run_ingestion_pipeline
-    from ai_core.sentiment import run_sentiment_analysis
-    from ai_core.utils import analyze_market_patterns
-    from ai_core.paths import LOG_DIR
-except ModuleNotFoundError:
-    # Fallback when running directly from repo root without installing
-    # Assumes this file lives at: .../NeuroFi/src/ai_core/agent.py
-    repo_root = Path(__file__).resolve().parents[2]  # .../NeuroFi
-    sys.path.insert(0, str(repo_root / "src"))
-    from ai_core.ingestion import run_ingestion_pipeline
-    from ai_core.sentiment import run_sentiment_analysis
-    from ai_core.utils import analyze_market_patterns
-    from ai_core.paths import LOG_DIR
+SCRAPED_DIR = Path("ai_core/scraped_data")
+ONCHAIN_DIR = Path("ai_core/onchain_data")
 
-# ==== Paths ====
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-LOG_DIR = PROJECT_ROOT / "logs"
-STATUS_DIR = PROJECT_ROOT / "status"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-STATUS_DIR.mkdir(parents=True, exist_ok=True)
-LOG_PATH = LOG_DIR / "bot_log.json"
-HEALTH_PATH = STATUS_DIR / "health.json"
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("agent")
 
-# ==== Structured JSON logging ====
-class JSONFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:
-        # Base payload
-        payload: Dict[str, Any] = {
-            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(record.created)),
-            "level": record.levelname,
-            "logger": record.name,
-            "message": record.getMessage(),
-        }
-        # Include extras if present
-        for attr in ("cycle_id", "step", "duration_s", "attempt", "max_attempts"):
-            if hasattr(record, attr):
-                payload[attr] = getattr(record, attr)
-        # Exception info
-        if record.exc_info:
-            payload["exc_type"] = record.exc_info[0].__name__
-            payload["exc"] = self.formatException(record.exc_info)
-        return json.dumps(payload, ensure_ascii=False)
+# Define channels to subscribe to
+CHANNELS = ["ticker", "candles", "level2", "market_trades", "status"]
 
-def get_logger() -> logging.Logger:
-    logger = logging.getLogger("cryptobot")
-    logger.setLevel(logging.INFO)
-    # Avoid duplicate handlers in interactive sessions
-    if logger.handlers:
-        return logger
-    handler = RotatingFileHandler(
-        LOG_PATH,
-        maxBytes=5 * 1024 * 1024,  # 5 MB
-        backupCount=5,
-        encoding="utf-8",
+# Extract market conditions from scraped and on-chain data
+def extract_market_conditions(scraped_data: dict, onchain_data: dict) -> dict:
+    text_blob = " ".join(scraped_data.get("content", []))
+    conditions = {
+        "volatility": 1.0,
+        "sentiment_score": 0.5,
+        "whale_activity": 0.5,
+    }
+
+    if "surge" in text_blob or "pump" in text_blob:
+        conditions["volatility"] += 0.3
+    if "bullish" in text_blob or "positive" in text_blob:
+        conditions["sentiment_score"] += 0.3
+    if "whale" in text_blob or "large wallet" in text_blob:
+        conditions["whale_activity"] += 0.4
+
+    if "whale_concentration" in onchain_data:
+        conditions["whale_activity"] += onchain_data["whale_concentration"] * 0.5
+    if "transaction_volume" in onchain_data:
+        conditions["volatility"] += min(1.0, onchain_data["transaction_volume"] / 1_000_000) * 0.3
+
+    return conditions
+
+# Load JSON data from file
+def ingest_json_data(directory: Path, goal_text: str) -> dict:
+    goal_file = directory / f"{goal_text.replace(' ', '_')}.json"
+    if not goal_file.exists():
+        logger.warning(f"No data found for goal: {goal_text} in {directory}")
+        return {}
+    with open(goal_file, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+# Extract token mentions from scraped data
+def extract_tokens(scraped_data: dict) -> list:
+    mentions = scraped_data.get("token_mentions", {})
+    return [token.upper() + "-USD" for token, count in mentions.items() if count > 0]
+
+# Solve a single goal
+async def solve_goal(goal_text: str, ws_listener: WebSocketListener):
+    logger.info(f"🎯 Solving goal: {goal_text}")
+    gather_data_for_goal(goal_text)
+    gather_onchain_data_for_goal(goal_text)
+
+    scraped = ingest_json_data(SCRAPED_DIR, goal_text)
+    onchain = ingest_json_data(ONCHAIN_DIR, goal_text)
+
+    if not scraped and not onchain:
+        update_goal_status(goal_text, "failed")
+        logger.error(f"❌ Goal '{goal_text}' failed due to missing data.")
+        return
+
+    # Subscribe to relevant tokens
+    tokens = extract_tokens(scraped)
+    for channel in CHANNELS:
+        await ws_listener.subscribe(channel, tokens)
+
+    conditions = extract_market_conditions(scraped, onchain)
+    logger.info(f"📊 Market conditions: {conditions}")
+
+    best_strategy, score = strategy_pool.select_best_strategy(conditions)
+    logger.info(f"🧠 Selected strategy: {best_strategy} (score: {score:.2f})")
+
+    log_strategy_performance(best_strategy, score, context={"goal": goal_text})
+    update_goal_status(goal_text, "completed")
+    logger.info(f"✅ Goal '{goal_text}' marked as completed.")
+
+# Main async loop
+async def run():
+    logger.info("🚀 Agent started.")
+    tick_queue = asyncio.Queue(maxsize=10000)
+    ws_listener = WebSocketListener(
+        ws_url="wss://advanced-trade-ws.coinbase.com",
+        out_queue=tick_queue,
+        top_movers_count=20,
     )
-    handler.setFormatter(JSONFormatter())
-    logger.addHandler(handler)
+    await ws_listener.run(initial_symbols=[])
 
-    # Also log a minimal line to console for operator visibility
-    console = logging.StreamHandler(sys.stdout)
-    console.setLevel(logging.INFO)
-    console.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
-    logger.addHandler(console)
-    return logger
-
-logger = get_logger()
-
-# ==== Utilities ====
-def write_health(status: Dict[str, Any]) -> None:
-    try:
-        HEALTH_PATH.write_text(json.dumps(status, indent=2))
-    except Exception:
-        logger.exception("Failed to write health file")
-
-def jittered_backoff(base: float, factor: float, attempt: int, max_delay: float) -> float:
-    # backoff = min(base * (factor ** (attempt-1)), max_delay) ± 20% jitter
-    delay = min(base * (factor ** max(0, attempt - 1)), max_delay)
-    jitter = delay * random.uniform(-0.2, 0.2)
-    return max(0.5, delay + jitter)
-
-def run_step(name: str, func: Callable[[], Any], cycle_id: int,
-             max_attempts: int = 3, base_delay: float = 2.0, factor: float = 2.0) -> Any:
-    """Run a single step with local retries so transient failures don't abort the whole cycle."""
-    attempt = 0
     while True:
-        attempt += 1
-        t0 = time.monotonic()
-        try:
-            logger.info(
-                f"▶️  Step start: {name}",
-                extra={"cycle_id": cycle_id, "step": name, "attempt": attempt, "max_attempts": max_attempts},
-            )
-            result = func()
-            dt = round(time.monotonic() - t0, 3)
-            logger.info(
-                f"✅ Step success: {name} ({dt}s)",
-                extra={"cycle_id": cycle_id, "step": name, "duration_s": dt, "attempt": attempt, "max_attempts": max_attempts},
-            )
-            return result
-        except Exception:
-            dt = round(time.monotonic() - t0, 3)
-            logger.exception(
-                f"❌ Step failed: {name} ({dt}s)",
-                extra={"cycle_id": cycle_id, "step": name, "duration_s": dt, "attempt": attempt, "max_attempts": max_attempts},
-            )
-            if attempt >= max_attempts:
-                raise
-            delay = jittered_backoff(base_delay, factor, attempt, max_delay=60)
-            logger.info(
-                f"↩️  Retrying step '{name}' in {round(delay,2)}s",
-                extra={"cycle_id": cycle_id, "step": name, "attempt": attempt, "max_attempts": max_attempts},
-            )
-            time.sleep(delay)
+        goal = get_next_pending_goal()
+        if not goal:
+            logger.info("⏳ No pending goals. Sleeping...")
+            await asyncio.sleep(30)
+            continue
+        await solve_goal(goal, ws_listener)
 
-def main_loop(interval_s: int = 60, max_cycle_delay: int = 300, stop_event: Event | None = None):
-    """
-    interval_s: desired time between cycle starts.
-    max_cycle_delay: cap for cycle-level exponential backoff after an unhandled error.
-    """
-    if stop_event is None:
-        stop_event = Event()
-
-    cycle_id = 0
-    cycle_backoff_base = 5.0
-    cycle_backoff_factor = 2.0
-    cycle_backoff_attempt = 0
-    logger.info("🚀 Cryptobot started.")
-    write_health({"status": "starting", "last_success_ts": None, "last_error": None})
-
-    while not stop_event.is_set():
-        cycle_id += 1
-        cycle_start_wall = time.time()
-        cycle_start = time.monotonic()
-        logger.info("🔁 Starting analysis cycle...", extra={"cycle_id": cycle_id})
-
-        try:
-            # --- Step 1: Ingest new data ---
-            run_step("ingestion", run_ingestion_pipeline, cycle_id)
-
-            # --- Step 2: Sentiment analysis ---
-            run_step("sentiment", run_sentiment_analysis, cycle_id)
-
-            # --- Step 3: Analyze patterns & predictions ---
-            run_step("pattern_analysis", analyze_market_patterns, cycle_id)
-
-            # Success housekeeping
-            cycle_backoff_attempt = 0
-            total_dt = round(time.monotonic() - cycle_start, 3)
-            logger.info("🏁 Cycle completed successfully.", extra={"cycle_id": cycle_id, "duration_s": total_dt})
-            write_health({
-                "status": "ok",
-                "last_success_ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(cycle_start_wall)),
-                "last_error": None,
-                "last_cycle_duration_s": total_dt,
-                "cycle_id": cycle_id,
-            })
-
-            # Sleep until next scheduled start (fixed-rate schedule)
-            next_start = cycle_start + interval_s
-            sleep_for = max(0.0, next_start - time.monotonic())
-            if stop_event.wait(timeout=sleep_for):
-                break
-
-        except Exception:
-            # Cycle-level failure (after step retries exhausted)
-            cycle_backoff_attempt += 1
-            total_dt = round(time.monotonic() - cycle_start, 3)
-            exc_text = traceback.format_exc()
-            logger.error(
-                "‼️  Error in bot cycle",
-                extra={"cycle_id": cycle_id, "duration_s": total_dt},
-                exc_info=True
-            )
-            write_health({
-                "status": "degraded",
-                "last_success_ts": None,
-                "last_error": {"cycle_id": cycle_id, "traceback": exc_text},
-                "last_cycle_duration_s": total_dt,
-            })
-            delay = jittered_backoff(cycle_backoff_base, cycle_backoff_factor, cycle_backoff_attempt, max_delay=max_cycle_delay)
-            logger.info(f"⏳ Retrying cycle in {round(delay,2)} seconds...", extra={"cycle_id": cycle_id})
-            if stop_event.wait(timeout=delay):
-                break
-
-    logger.info("🛑 Cryptobot stopped.")
-    write_health({"status": "stopped", "last_success_ts": None, "last_error": None})
-
-def _install_signal_handlers(stop_event: Event):
-    def _handler(signum, _frame):
-        logger.info(f"Signal received ({signum}). Shutting down gracefully...")
-        stop_event.set()
-    signal.signal(signal.SIGINT, _handler)   # Ctrl+C
-    signal.signal(signal.SIGTERM, _handler)  # Termination (systemd/Docker/K8s)
-
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="NeuroFi Cryptobot loop")
-    p.add_argument("--interval", type=int, default=60, help="Seconds between cycle starts (default: 60)")
-    p.add_argument("--max-delay", type=int, default=300, help="Max cycle backoff delay in seconds (default: 300)")
-    p.add_argument("--once", action="store_true", help="Run a single cycle and exit")
-    return p.parse_args()
-
-def run_once():
-    # For quick local testing
-    stop = Event()
-    _install_signal_handlers(stop)
-    # Make interval large enough so we exit after one cycle
-    main_loop(interval_s=3600, max_cycle_delay=300, stop_event=stop)
-
+# Entry point
 if __name__ == "__main__":
-    args = parse_args()
-    stop_event = Event()
-    _install_signal_handlers(stop_event)
-    if args.once:
-        run_once()
-    else:
-        main_loop(interval_s=args.interval, max_cycle_delay=args.max_delay, stop_event=stop_event)
+    asyncio.run(run()) 

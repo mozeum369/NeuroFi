@@ -1,103 +1,95 @@
 import os
-import requests
-from bs4 import BeautifulSoup
-from datetime import datetime
+import re
+import json
+from textblob import TextBlob
 from pathlib import Path
+from bs4 import BeautifulSoup
+import requests
 
-# -------------------- Configuration --------------------
+# Directory to save scraped data
+SCRAPED_DIR = Path("ai_core/scraped_data")
+SCRAPED_DIR.mkdir(parents=True, exist_ok=True)
 
-SCRAPE_DIR = Path("ai_core/scraped_data")
-SCRAPE_DIR.mkdir(parents=True, exist_ok=True)
+# Local NLP sentiment analysis
+def analyze_sentiment(text_list):
+    results = []
+    for text in text_list:
+        blob = TextBlob(text)
+        results.append({
+            "text": text,
+            "polarity": blob.sentiment.polarity,
+            "subjectivity": blob.sentiment.subjectivity
+        })
+    return results
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; NeuroFiBot/1.0; +https://neurofi.local)"
-}
+# Token mention detection
+def extract_token_mentions(text_list, token_list):
+    mentions = {token.lower(): 0 for token in token_list}
+    for text in text_list:
+        lower_text = text.lower()
+        for token in token_list:
+            if re.search(rf"\b{re.escape(token.lower())}\b", lower_text):
+                mentions[token.lower()] += 1
+    return mentions
 
-SOURCE_MAP = {
-    "crypto_news": [
-        "https://www.coindesk.com/",
-        "https://cryptoslate.com/",
-        "https://cointelegraph.com/"
-    ],
-    "reddit_crypto": [
-        "https://www.reddit.com/r/CryptoCurrency/",
-        "https://www.reddit.com/r/Bitcoin/",
-        "https://www.reddit.com/r/Ethereum/"
-    ],
-    "github_trending": [
-        "https://github.com/trending"
-    ]
-}
-
-
-# -------------------- Core Functions --------------------
-
-def accept_goal(goal_text: str) -> dict:
-    """Accepts a goal and returns a metadata dictionary."""
-    return {
-        "goal": goal_text,
-        "timestamp": datetime.utcnow().isoformat(),
-        "sources": list(SOURCE_MAP.keys())
-    }
-
-
-def scrape_url(url: str) -> str:
-    """Scrapes HTML content from a URL and returns cleaned text."""
+# Scrape visible text from a URL
+def scrape_url(url):
     try:
-        response = requests.get(url, headers=HEADERS, timeout=10)
-        response.raise_for_status()
+        response = requests.get(url, timeout=10)
+        if response.status_code != 200:
+            return ""
         soup = BeautifulSoup(response.text, "html.parser")
-        # Extract visible text
         texts = soup.stripped_strings
-        return "\n".join(texts)
+        return " ".join(texts)
     except Exception as e:
-        print(f"[ERROR] Failed to scrape {url}: {e}")
+        print(f"Error scraping {url}: {e}")
         return ""
 
-
-def gather_data_for_goal(goal_text: str) -> dict:
-    """Scrapes all relevant sources for the given goal and returns a dictionary of results."""
-    goal_meta = accept_goal(goal_text)
-    results = {}
-
-    for source_key, urls in SOURCE_MAP.items():
-        source_results = []
-        for url in urls:
-            print(f"[SCRAPE] {source_key}: {url}")
-            content = scrape_url(url)
-            if content:
-                source_results.append({
-                    "url": url,
-                    "content": content[:10000]  # Limit to 10k chars per source
-                })
-        results[source_key] = source_results
-
+# Accept a goal and determine sources
+def accept_goal(goal_text):
     return {
         "goal": goal_text,
-        "timestamp": goal_meta["timestamp"],
-        "results": results
+        "sources": {
+            "news": [
+                "https://www.coindesk.com/",
+                "https://cryptoslate.com/",
+                "https://cointelegraph.com/"
+            ],
+            "reddit": [
+                "https://www.reddit.com/r/CryptoCurrency/",
+                "https://www.reddit.com/r/Bitcoin/",
+                "https://www.reddit.com/r/Ethereum/"
+            ],
+            "github": [
+                "https://github.com/trending"
+            ]
+        }
     }
 
+# Gather data for a goal
+def gather_data_for_goal(goal_text, token_list=None):
+    goal_info = accept_goal(goal_text)
+    all_texts = []
+    for category, urls in goal_info["sources"].items():
+        for url in urls:
+            print(f"Scraping {url}...")
+            text = scrape_url(url)
+            if text:
+                all_texts.append(text)
 
-def save_scraped_data(goal_text: str, data: dict):
-    """Saves scraped data to a JSON file named after the goal."""
-    import json
-    safe_name = "".join(c if c.isalnum() else "_" for c in goal_text)[:50]
-    filename = f"{safe_name}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.json"
-    out_path = SCRAPE_DIR / filename
+    sentiment_results = analyze_sentiment(all_texts)
+    token_mentions = extract_token_mentions(all_texts, token_list or ["Bitcoin", "Ethereum", "Pepe", "Zora"])
+
+    output = {
+        "goal": goal_text,
+        "content": all_texts,
+        "sentiment": sentiment_results,
+        "token_mentions": token_mentions
+    }
+
+    # Save to file
+    out_path = SCRAPED_DIR / f"{goal_text.replace(' ', '_')}.json"
     with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    print(f"[SAVE] Scraped data saved to {out_path}")
+        json.dump(output, f, indent=2)
 
-
-# -------------------- CLI Entry --------------------
-
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="NeuroFi Crawler")
-    parser.add_argument("--goal", type=str, required=True, help="Goal to guide scraping")
-    args = parser.parse_args()
-
-    goal_text = args.goal
-    scraped = gather_data_for_goal(goal_text)
-    save_scraped_data(goal_text, scraped) 
+    return output 
