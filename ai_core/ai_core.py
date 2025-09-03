@@ -99,3 +99,16 @@ if __name__ == "__main__":
     # Print recent goals and top strategies
     print("Recent goals:", get_recent_goals())
     print("Top strategies:", get_top_strategies()) 
+
+
+# -------------------- Goal Retrieval --------------------
+
+def get_next_pending_goal() -> Dict[str, Any] | None:
+    """
+    Return the next pending goal (FIFO) or None if none exist.
+    """
+    goals = load_goals()
+    for goal in goals:
+        if goal.get("status") == "pending":
+            return goal
+    return None

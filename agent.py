@@ -6,8 +6,11 @@ import json
 import logging
 import time
 import asyncio
-from ai_core import __init__
-
+from ai_core import (
+    get_next_pending_goal,
+    update_goal_status,
+    log_strategy_performance,
+)
 from strategy_selector import pool as strategy_pool
 from crawler import gather_data_for_goal
 from onchain_scraper import gather_onchain_data_for_goal
