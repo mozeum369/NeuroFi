@@ -6,20 +6,13 @@ import json
 import logging
 import time
 import asyncio
-from ai_core import (
-    get_next_pending_goal,
-    update_goal_status,
-    log_strategy_performance,
-)
+from ai_core import __init__
+
 from strategy_selector import pool as strategy_pool
 from crawler import gather_data_for_goal
 from onchain_scraper import gather_onchain_data_for_goal
 from ws_listener import WebSocketListener
 
-SCRAPED_DIR = Path("ai_core/scraped_data")
-ONCHAIN_DIR = Path("ai_core/onchain_data")
-
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -27,10 +20,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("agent")
 
+SCRAPED_DIR = Path("ai_core/scraped_data")
+ONCHAIN_DIR = Path("ai_core/onchain_data")
+
 # Define channels to subscribe to
 CHANNELS = ["ticker", "candles", "level2", "market_trades", "status"]
 
-# Extract market conditions from scraped and on-chain data
 def extract_market_conditions(scraped_data: dict, onchain_data: dict) -> dict:
     text_blob = " ".join(scraped_data.get("content", []))
     conditions = {
@@ -53,7 +48,6 @@ def extract_market_conditions(scraped_data: dict, onchain_data: dict) -> dict:
 
     return conditions
 
-# Load JSON data from file
 def ingest_json_data(directory: Path, goal_text: str) -> dict:
     goal_file = directory / f"{goal_text.replace(' ', '_')}.json"
     if not goal_file.exists():
@@ -62,13 +56,14 @@ def ingest_json_data(directory: Path, goal_text: str) -> dict:
     with open(goal_file, "r", encoding="utf-8") as f:
         return json.load(f)
 
-# Extract token mentions from scraped data
-def extract_tokens(scraped_data: dict) -> list:
-    mentions = scraped_data.get("token_mentions", {})
-    return [token.upper() + "-USD" for token, count in mentions.items() if count > 0]
+async def subscribe_to_tokens(ws_listener, scraped_data: dict):
+    token_mentions = scraped_data.get("token_mentions", {})
+    tokens = [f"{token.upper()}-USD" for token in token_mentions.keys()]
+    for channel in CHANNELS:
+        await ws_listener.subscribe(channel, tokens)
+        logger.info(f"Subscribed to {channel} for tokens: {tokens}")
 
-# Solve a single goal
-async def solve_goal(goal_text: str, ws_listener: WebSocketListener):
+async def solve_goal(goal_text: str, ws_listener):
     logger.info(f"🎯 Solving goal: {goal_text}")
     gather_data_for_goal(goal_text)
     gather_onchain_data_for_goal(goal_text)
@@ -81,10 +76,7 @@ async def solve_goal(goal_text: str, ws_listener: WebSocketListener):
         logger.error(f"❌ Goal '{goal_text}' failed due to missing data.")
         return
 
-    # Subscribe to relevant tokens
-    tokens = extract_tokens(scraped)
-    for channel in CHANNELS:
-        await ws_listener.subscribe(channel, tokens)
+    await subscribe_to_tokens(ws_listener, scraped)
 
     conditions = extract_market_conditions(scraped, onchain)
     logger.info(f"📊 Market conditions: {conditions}")
@@ -96,8 +88,7 @@ async def solve_goal(goal_text: str, ws_listener: WebSocketListener):
     update_goal_status(goal_text, "completed")
     logger.info(f"✅ Goal '{goal_text}' marked as completed.")
 
-# Main async loop
-async def run():
+async def main():
     logger.info("🚀 Agent started.")
     tick_queue = asyncio.Queue(maxsize=10000)
     ws_listener = WebSocketListener(
@@ -105,7 +96,7 @@ async def run():
         out_queue=tick_queue,
         top_movers_count=20,
     )
-    await ws_listener.run(initial_symbols=[])
+    await ws_listener.run(initial_symbols=None)
 
     while True:
         goal = get_next_pending_goal()
@@ -115,6 +106,5 @@ async def run():
             continue
         await solve_goal(goal, ws_listener)
 
-# Entry point
 if __name__ == "__main__":
-    asyncio.run(run()) 
+    asyncio.run(main()) 
