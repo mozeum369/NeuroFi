@@ -1,8 +1,12 @@
+from dotenv import load_dotenv
+load_dotenv()
 import requests
 import json
 import csv
 from datetime import datetime
 from pathlib import Path
+import os
+api_key = os.getenv("FREECRYPTOAPI_KEY")
 
 # Configuration
 API_URL = "https://freecryptoapi.com/api/v1/getHistory"

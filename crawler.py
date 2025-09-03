@@ -93,3 +93,11 @@ def gather_data_for_goal(goal_text, token_list=None):
         json.dump(output, f, indent=2)
 
     return output 
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="NeuroFi Crawler")
+    parser.add_argument("--goal", type=str, required=True, help="Goal to guide scraping")
+    args = parser.parse_args()
+
+    gather_data_for_goal(args.goal) 
