@@ -185,3 +185,61 @@ mock_market_conditions = {
 }
 
 best_strategy, score = pool.select_best_strategy(mock_market_conditions) 
+
+# -------------------- Backtesting Framework --------------------
+
+import random
+
+class Backtester:
+    def __init__(self, strategy_pool: StrategyPool, historical_conditions: List[Dict[str, float]]):
+        self.pool = strategy_pool
+        self.historical_conditions = historical_conditions
+        self.results = []
+
+    def run(self):
+        for i, conditions in enumerate(self.historical_conditions):
+            evaluations = self.pool.evaluate_strategies(conditions)
+            best_strategy = max(evaluations, key=evaluations.get)
+            score = evaluations[best_strategy]
+            self.results.append({
+                "period": i + 1,
+                "conditions": conditions,
+                "best_strategy": best_strategy,
+                "score": score
+            })
+            print(f"[Backtest] Period {i+1}: {best_strategy} → Score: {score:.2f}")
+
+    def summarize(self):
+        summary = {}
+        for result in self.results:
+            name = result["best_strategy"]
+            summary.setdefault(name, []).append(result["score"])
+        avg_scores = {name: sum(scores)/len(scores) for name, scores in summary.items()}
+        sorted_summary = sorted(avg_scores.items(), key=lambda x: x[1], reverse=True)
+        print("\n[Backtest Summary]")
+        for name, avg in sorted_summary:
+            print(f"{name}: Avg Score = {avg:.2f}")
+        return sorted_summary
+
+
+# -------------------- Simulated Historical Conditions --------------------
+
+def generate_mock_historical_conditions(n: int = 10) -> List[Dict[str, float]]:
+    return [
+        {
+            "volatility": round(random.uniform(0.8, 2.0), 2),
+            "sentiment_score": round(random.uniform(0.3, 0.9), 2),
+            "whale_activity": round(random.uniform(0.2, 1.0), 2)
+        }
+        for _ in range(n)
+    ]
+
+
+# -------------------- Run Backtest --------------------
+
+if __name__ == "__main__":
+    historical_conditions = generate_mock_historical_conditions(15)
+    backtester = Backtester(pool, historical_conditions)
+    backtester.run()
+    backtester.summarize()
+ 
