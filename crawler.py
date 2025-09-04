@@ -4,7 +4,10 @@ import json
 from textblob import TextBlob
 from pathlib import Path
 from bs4 import BeautifulSoup
-import requests
+import argparse
+
+# Import utility functions from data_utils
+from data_utils import log_message, save_data_snapshot, safe_fetch_json
 
 # Directory to save scraped data
 SCRAPED_DIR = Path("ai_core/scraped_data")
@@ -35,14 +38,15 @@ def extract_token_mentions(text_list, token_list):
 # Scrape visible text from a URL
 def scrape_url(url):
     try:
-        response = requests.get(url, timeout=10)
-        if response.status_code != 200:
+        response = safe_fetch_json(url)
+        if not response:
+            log_message(f"Failed to scrape {url}", level='warning')
             return ""
         soup = BeautifulSoup(response.text, "html.parser")
         texts = soup.stripped_strings
         return " ".join(texts)
     except Exception as e:
-        print(f"Error scraping {url}: {e}")
+        log_message(f"Error scraping {url}: {e}", level='error')
         return ""
 
 # Accept a goal and determine sources
@@ -72,7 +76,7 @@ def gather_data_for_goal(goal_text, token_list=None):
     all_texts = []
     for category, urls in goal_info["sources"].items():
         for url in urls:
-            print(f"Scraping {url}...")
+            log_message(f"Scraping {url}...")
             text = scrape_url(url)
             if text:
                 all_texts.append(text)
@@ -87,15 +91,10 @@ def gather_data_for_goal(goal_text, token_list=None):
         "token_mentions": token_mentions
     }
 
-    # Save to file
-    out_path = SCRAPED_DIR / f"{goal_text.replace(' ', '_')}.json"
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(output, f, indent=2)
-
-    return output 
+    save_data_snapshot(output, prefix=f"{goal_text.replace(' ', '_')}")
+    return output
 
 if __name__ == "__main__":
-    import argparse
     parser = argparse.ArgumentParser(description="NeuroFi Crawler")
     parser.add_argument("--goal", type=str, required=True, help="Goal to guide scraping")
     args = parser.parse_args()
