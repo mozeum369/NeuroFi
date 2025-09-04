@@ -133,6 +133,105 @@ def identify_stalled_goals(max_age_seconds: int = 86400) -> List[str]:
                 stalled.append(goal["goal"])
     return stalled
 
+# -------------------- Reinforcement Learning Components --------------------
+
+class CryptoEnv:
+    def __init__(self, strategies: List[str]):
+        self.strategies = strategies
+        self.current_index = 0
+
+    def reset(self):
+        self.current_index = 0
+        return self._get_state()
+
+    def step(self, action: str):
+        score = calculate_strategy_accuracy(action)
+        reward = score  # Simplified reward: accuracy as proxy
+        self.current_index += 1
+        done = self.current_index >= len(self.strategies)
+        next_state = self._get_state()
+        return next_state, reward, done, {}
+
+    def _get_state(self):
+        if self.current_index < len(self.strategies):
+            return {"strategy": self.strategies[self.current_index]}
+        return {"strategy": None}
+
+
+class RLAgent:
+    def __init__(self, env: CryptoEnv):
+        self.env = env
+        self.policy: Dict[str, float] = {}
+
+    def select_action(self, state: Dict[str, Any]) -> str:
+        strategy = state["strategy"]
+        if strategy not in self.policy:
+            self.policy[strategy] = 1.0  # Default confidence
+        return strategy
+
+    def learn(self, state: Dict[str, Any], action: str, reward: float):
+        self.policy[action] = self.policy.get(action, 0.0) + 0.1 * (reward - self.policy.get(action, 0.0))
+
+
+def run_rl_training_loop(episodes: int = 5):
+    strategies = get_top_strategies(n=10)
+    env = CryptoEnv(strategies)
+    agent = RLAgent(env)
+
+    for episode in range(episodes):
+        state = env.reset()
+        done = False
+        total_reward = 0.0
+
+        while not done:
+            action = agent.select_action(state)
+            next_state, reward, done, _ = env.step(action)
+            agent.learn(state, action, reward)
+            state = next_state
+            total_reward += reward
+
+        print(f"[RL] Episode {episode + 1} → Total Reward: {total_reward:.2f}")
+
+# -------------------- SHAP Explainability for RL Decisions --------------------
+
+import shap
+import numpy as np
+
+class SHAPWrapperModel:
+    """
+    A mock model wrapper to simulate RLAgent's decision logic for SHAP.
+    """
+    def __init__(self, agent: RLAgent):
+        self.agent = agent
+
+    def predict(self, X: List[Dict[str, Any]]) -> np.ndarray:
+        return np.array([
+            self.agent.policy.get(x["strategy"], 1.0) for x in X
+        ]).reshape(-1, 1)
+
+
+def explain_rl_decision(agent: RLAgent, strategy_name: str):
+    explainer = shap.Explainer(SHAPWrapperModel(agent).predict, feature_names=["strategy"])
+    sample_input = [{"strategy": strategy_name}]
+    shap_values = explainer(sample_input)
+
+    print(f"\n[SHAP] Explanation for strategy: {strategy_name}")
+    shap.plots.text(shap_values[0])
+ 
+
+ 
+
+🧪 Usage Example
+
+Add this to your  __main__  block or after  run_rl_training_loop() :
+
+ 
+    # After training
+    agent = RLAgent(CryptoEnv(get_top_strategies()))
+    agent.policy["MomentumStrategy"] = 1.8  # Simulate learned value
+    explain_rl_decision(agent, "MomentumStrategy")
+ 
+
 # -------------------- Example Usage --------------------
 
 if __name__ == "__main__":
