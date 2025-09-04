@@ -43,6 +43,17 @@ def update_goal_status(goal_text: str, status: str) -> None:
     GOALS_FILE.write_text(json.dumps(goals, indent=2))
     print(f"[AI_CORE] Goal status updated: {goal_text} → {status}")
 
+import json
+from pathlib import Path
+
+GOAL_METADATA_DIR = Path("ai_core/goal_metadata")
+GOAL_METADATA_DIR.mkdir(exist_ok=True)
+
+def update_goal_metadata(goal_text: str, metadata: dict):
+    goal_file = GOAL_METADATA_DIR / f"{goal_text.replace(' ', '_')}.json"
+    with open(goal_file, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+
 def get_next_pending_goal() -> Optional[Dict[str, Any]]:
     goals = load_goals()
     sorted_goals = sorted(goals, key=lambda g: g.get("metadata", {}).get("priority", "medium"), reverse=True)
@@ -133,11 +144,12 @@ def identify_stalled_goals(max_age_seconds: int = 86400) -> List[str]:
                 stalled.append(goal["goal"])
     return stalled
 
-# -------------------- Reinforcement Learning Components --------------------
+# -------------------- Goal-Linked Reinforcement Learning --------------------
 
-class CryptoEnv:
-    def __init__(self, strategies: List[str]):
+class GoalLinkedEnv:
+    def __init__(self, strategies: List[str], goal: Dict[str, Any]):
         self.strategies = strategies
+        self.goal = goal
         self.current_index = 0
 
     def reset(self):
@@ -146,7 +158,7 @@ class CryptoEnv:
 
     def step(self, action: str):
         score = calculate_strategy_accuracy(action)
-        reward = score  # Simplified reward: accuracy as proxy
+        reward = score
         self.current_index += 1
         done = self.current_index >= len(self.strategies)
         next_state = self._get_state()
@@ -154,29 +166,36 @@ class CryptoEnv:
 
     def _get_state(self):
         if self.current_index < len(self.strategies):
-            return {"strategy": self.strategies[self.current_index]}
-        return {"strategy": None}
+            return {
+                "strategy": self.strategies[self.current_index],
+                "goal": self.goal["goal"],
+                "priority": self.goal.get("metadata", {}).get("priority", "medium")
+            }
+        return {"strategy": None, "goal": self.goal["goal"], "priority": self.goal.get("metadata", {}).get("priority", "medium")}
 
-
-class RLAgent:
-    def __init__(self, env: CryptoEnv):
+class GoalLinkedAgent:
+    def __init__(self, env: GoalLinkedEnv):
         self.env = env
         self.policy: Dict[str, float] = {}
 
     def select_action(self, state: Dict[str, Any]) -> str:
         strategy = state["strategy"]
         if strategy not in self.policy:
-            self.policy[strategy] = 1.0  # Default confidence
+            self.policy[strategy] = 1.0
         return strategy
 
     def learn(self, state: Dict[str, Any], action: str, reward: float):
         self.policy[action] = self.policy.get(action, 0.0) + 0.1 * (reward - self.policy.get(action, 0.0))
 
+def run_goal_linked_rl_loop(episodes: int = 3):
+    goal = get_next_pending_goal()
+    if not goal:
+        print("[RL] No pending goals found.")
+        return
 
-def run_rl_training_loop(episodes: int = 5):
     strategies = get_top_strategies(n=10)
-    env = CryptoEnv(strategies)
-    agent = RLAgent(env)
+    env = GoalLinkedEnv(strategies, goal)
+    agent = GoalLinkedAgent(env)
 
     for episode in range(episodes):
         state = env.reset()
@@ -190,18 +209,17 @@ def run_rl_training_loop(episodes: int = 5):
             state = next_state
             total_reward += reward
 
-        print(f"[RL] Episode {episode + 1} → Total Reward: {total_reward:.2f}")
+        print(f"[RL] Goal: {goal['goal']} | Episode {episode + 1} → Total Reward: {total_reward:.2f}")
 
-# -------------------- SHAP Explainability for RL Decisions --------------------
+    return agent, goal
+
+# -------------------- SHAP Explainability --------------------
 
 import shap
 import numpy as np
 
 class SHAPWrapperModel:
-    """
-    A mock model wrapper to simulate RLAgent's decision logic for SHAP.
-    """
-    def __init__(self, agent: RLAgent):
+    def __init__(self, agent: GoalLinkedAgent):
         self.agent = agent
 
     def predict(self, X: List[Dict[str, Any]]) -> np.ndarray:
@@ -209,28 +227,12 @@ class SHAPWrapperModel:
             self.agent.policy.get(x["strategy"], 1.0) for x in X
         ]).reshape(-1, 1)
 
-
-def explain_rl_decision(agent: RLAgent, strategy_name: str):
+def explain_goal_linked_decision(agent: GoalLinkedAgent, strategy_name: str):
     explainer = shap.Explainer(SHAPWrapperModel(agent).predict, feature_names=["strategy"])
     sample_input = [{"strategy": strategy_name}]
     shap_values = explainer(sample_input)
-
     print(f"\n[SHAP] Explanation for strategy: {strategy_name}")
     shap.plots.text(shap_values[0])
- 
-
- 
-
-🧪 Usage Example
-
-Add this to your  __main__  block or after  run_rl_training_loop() :
-
- 
-    # After training
-    agent = RLAgent(CryptoEnv(get_top_strategies()))
-    agent.policy["MomentumStrategy"] = 1.8  # Simulate learned value
-    explain_rl_decision(agent, "MomentumStrategy")
- 
 
 # -------------------- Example Usage --------------------
 
@@ -244,4 +246,9 @@ if __name__ == "__main__":
     print("MomentumStrategy accuracy:", calculate_strategy_accuracy("MomentumStrategy"))
     print("MomentumStrategy Sharpe ratio:", calculate_sharpe_ratio("MomentumStrategy"))
     print("Underperforming strategies:", identify_underperforming_strategies())
-    print("Stalled goals:", identify_stalled_goals()) 
+    print("Stalled goals:", identify_stalled_goals())
+
+    # Run goal-linked RL loop and explain decision
+    agent, goal = run_goal_linked_rl_loop(episodes=2)
+    if agent:
+        explain_goal_linked_decision(agent, "MomentumStrategy") 

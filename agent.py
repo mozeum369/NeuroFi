@@ -10,6 +10,7 @@ from ai_core import (
     update_goal_status,
     log_strategy_performance,
     load_strategy_logs,
+    update_goal_metadata 
 )
 from strategy_selector import pool as strategy_pool
 from crawler import gather_data_for_goal
@@ -112,6 +113,13 @@ async def solve_goal(goal_text: str, ws_listener):
         "accuracy": accuracy,
         "sharpe_ratio": sharpe_ratio
     })
+    update_goal_metadata(goal_text, {
+	"selected_strategy": best_strategy,
+	"score": score,
+	"accuracy": accuracy,
+	"sharpe_ratio": sharpe_ratio,
+	"market_conditions": conditions
+})
     update_goal_status(goal_text, "completed")
     logger.info(f"✅ Goal '{goal_text}' marked as completed.")
 
