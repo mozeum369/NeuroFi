@@ -5,6 +5,7 @@ import asyncio
 import numpy as np
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+from datetime import datetime, timezone, timedelta
 
 # --- Your existing imports (kept) ---
 from ai_core import (
@@ -18,7 +19,7 @@ from strategy_selector import pool as strategy_pool
 from crawler import gather_data_for_goal
 from onchain_scraper import gather_onchain_data_for_goal
 
-# WebSocket listener (we support both your current and upgraded versions)
+# WebSocket listener
 from ws_listener import WebSocketListener
 
 # --- NEW: pipeline config + live resampler + historical OHLC helpers ---
@@ -46,14 +47,13 @@ logger = logging.getLogger("agent")
 SCRAPED_DIR = Path("ai_core/scraped_data")
 ONCHAIN_DIR = Path("ai_core/onchain_data")
 
-# Your channel policy (used when upgraded ws_listener is present)
-CHANNELS = ["ticker", "candles", "level2", "market_trades", "status"]
+# Channels we manage (when ws_listener supports multi-channel)
+CHANNELS = ["ticker", "candles", "level2", "status"]
 
 # ----------------------------------------------------------------------
 # ai_core hook (optional, async)
 # ----------------------------------------------------------------------
 try:
-    # If you implement this in ai_core/ai_core.py, we’ll call it on each new bar
     from ai_core.ai_core import on_new_bar  # async def on_new_bar(product_id, ts_iso, rowdict)
 except Exception:
     async def on_new_bar(product_id: str, bar_ts_iso: str, bar_row: Dict[str, Any]):
@@ -63,18 +63,13 @@ except Exception:
 # Utility helpers
 # ----------------------------------------------------------------------
 def resolve_symbol_to_product(symbol: str, currency: str = "USD") -> str:
-    """'BTC' -> 'BTC-USD'  | 'BTC-USD' stays as-is."""
     sym = symbol.upper()
     if "-" in sym:
         return sym
     return f"{sym}-{currency.upper()}"
 
-def canonical_path(config: DataPipelineConfig, product_id: str) -> Path:
-    return config.canonical_path(product_id)
-
 def save_canonical_ohlc(config: DataPipelineConfig, product_id: str, ohlc_df):
-    """Write canonical OHLC (shared by historical + live)."""
-    path = canonical_path(config, product_id)
+    path = config.canonical_path(product_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     out = ohlc_df.copy().sort_index()
     out.index = out.index.tz_convert("UTC")
@@ -129,27 +124,27 @@ def calculate_strategy_accuracy(strategy_name: str) -> float:
     return correct_predictions / len(strategy_scores)
 
 # ----------------------------------------------------------------------
-# Subscriptions (compatible with both ws_listener variants)
+# Subscriptions (compatible with old/new ws_listener variants)
 # ----------------------------------------------------------------------
 async def _safe_add_subscription(ws_listener, channel: str, product_ids: List[str]):
-    """
-    Works with:
-      - Upgraded listener: add_subscription(channel, product_ids)
-      - Your newer signature: subscribe(channel, product_ids)
-      - Older signature: subscribe(product_ids)  [ticker only]
-    """
     if hasattr(ws_listener, "add_subscription"):
         await ws_listener.add_subscription(channel, product_ids)
     elif hasattr(ws_listener, "subscribe"):
         try:
-            # Try (channel, products)
             await ws_listener.subscribe(channel, product_ids)  # type: ignore
         except TypeError:
-            # Fall back to (products) only for ticker
             if channel == "ticker":
                 await ws_listener.subscribe(product_ids)        # type: ignore
     else:
         logger.warning("ws_listener has no add_subscription/subscribe method.")
+
+async def _safe_remove_subscription(ws_listener, channel: str, product_ids: List[str]):
+    if not product_ids:
+        return
+    if hasattr(ws_listener, "remove_subscription"):
+        await ws_listener.remove_subscription(channel, product_ids)
+    else:
+        logger.warning("ws_listener.remove_subscription not available; cannot unsubscribe in this version.")
 
 async def subscribe_to_tokens(ws_listener, scraped_data: dict):
     token_mentions = scraped_data.get("token_mentions", {})
@@ -161,7 +156,7 @@ async def subscribe_to_tokens(ws_listener, scraped_data: dict):
         logger.info(f"Subscribed to {channel} for tokens: {tokens}")
 
 # ----------------------------------------------------------------------
-# Goal solving (yours, unchanged, with subscriptions)
+# Goal solving (yours, unchanged, but passes live ws_listener)
 # ----------------------------------------------------------------------
 async def solve_goal(goal_text: str, ws_listener):
     logger.info(f"🎯 Solving goal: {goal_text}")
@@ -209,7 +204,6 @@ async def solve_goal(goal_text: str, ws_listener):
 def bootstrap_backfill(config: DataPipelineConfig, symbols_or_products: List[str]):
     logger.info(f"[Bootstrap] Backfill start={config.backfill_start}, end={config.backfill_end or 'now'}, freq={config.resample_freq}")
     for ident in symbols_or_products:
-        # For CoinGecko we accept 'BTC' etc.; if product given (BTC-USD), convert to symbol
         if "-" in ident:
             symbol = ident.split("-")[0]
             product_id = ident.upper()
@@ -223,62 +217,213 @@ def bootstrap_backfill(config: DataPipelineConfig, symbols_or_products: List[str
             continue
 
         rows = normalize_market_chart_to_rows(raw)
-        df = rows_to_dataframe(rows)              # -> columns: price, volume (UTC index)
+        df = rows_to_dataframe(rows)
         ohlc = aggregate_to_ohlc(df, freq=config.resample_freq)
         if ohlc is not None and not ohlc.empty:
             save_canonical_ohlc(config, product_id, ohlc)
 
 # ----------------------------------------------------------------------
-# Live pipeline: WS + real-time OHLC + notifier to ai_core
+# Top Movers Coordinator
 # ----------------------------------------------------------------------
-async def run_live_pipeline(config: DataPipelineConfig):
-    # 1) Real-time resampler (5m -> 1H/1D), writes canonical OHLC files
+class TopMoversCoordinator:
+    """
+    Periodically reads ai_core/signals/top_movers_candidates.json,
+    selects top-N + sticky seeds, and syncs WS subscriptions.
+    """
+    def __init__(self, config: DataPipelineConfig, ws_listener: WebSocketListener):
+        self.cfg = config
+        self.ws = ws_listener
+        self.state_file = Path("ai_core/signals/top_movers_candidates.json")
+        self.current: set[str] = set(config.seed_products) if config.include_seed_products else set()
+        self.sticky: set[str] = set(config.seed_products) if config.include_seed_products else set()
+        self.last_action_at: dict[str, float] = {}
+        self.channels_to_manage = [ch for ch in self.cfg.channels if ch in ("candles", "ticker", "level2")]
+
+    def _now(self) -> float:
+        return time.time()
+
+    def _is_fresh(self, iso: str) -> bool:
+        try:
+            dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+            age = datetime.now(timezone.utc) - dt
+            return age.total_seconds() <= self.cfg.freshness_sec
+        except Exception:
+            return False
+
+    def _load_candidates(self) -> dict:
+        if not self.state_file.exists():
+            return {}
+        try:
+            return json.loads(self.state_file.read_text())
+        except Exception as e:
+            logger.warning(f"[TopMovers] Failed to read candidates: {e}")
+            return {}
+
+    def _rank_desired(self) -> list[str]:
+        data = self._load_candidates()
+        items = []
+        for pid, info in data.items():
+            score = float(info.get("score", 0.0))
+            updated = info.get("updated")
+            if score < self.cfg.min_candidate_score:
+                continue
+            if updated and not self._is_fresh(updated):
+                continue
+            items.append((pid, score))
+        items.sort(key=lambda x: x[1], reverse=True)
+        return [pid for pid, _ in items]
+
+    def _apply_hysteresis(self, ranked: list[str]) -> set[str]:
+        limit = max(self.cfg.top_movers_count - len(self.sticky), 0)
+        desired_core = set(ranked[:limit])
+        desired = set(self.sticky) | desired_core
+
+        data = self._load_candidates()
+        cutoff_pid = ranked[limit-1] if limit > 0 and len(ranked) >= limit else None
+        cutoff_score = float(data.get(cutoff_pid, {}).get("score", 0.0)) if cutoff_pid else None
+
+        if cutoff_score is not None:
+            margin = self.cfg.hysteresis_margin
+            for pid in self.current - self.sticky:
+                if pid in desired:
+                    continue
+                my_score = float(data.get(pid, {}).get("score", 0.0))
+                if my_score >= (cutoff_score - margin):
+                    desired.add(pid)
+        return desired
+
+    def _cooldown_ok(self, pid: str) -> bool:
+        t = self.last_action_at.get(pid, 0.0)
+        return (self._now() - t) >= self.cfg.cooldown_sec
+
+    async def _bootstrap_new(self, add_list: list[str]):
+        if not (self.cfg.bootstrap_on_add and add_list):
+            return
+        start = (datetime.now(timezone.utc) - timedelta(days=self.cfg.bootstrap_lookback_days)).strftime("%Y-%m-%d")
+        end = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        for pid in add_list:
+            try:
+                sym = pid.split("-")[0]
+                raw = fetch_historical_data(sym, self.cfg.vs_currency, start, end)
+                if raw:
+                    rows = normalize_market_chart_to_rows(raw)
+                    df = rows_to_dataframe(rows)
+                    ohlc = aggregate_to_ohlc(df, freq=self.cfg.resample_freq)
+                    if ohlc is not None and not ohlc.empty:
+                        path = self.cfg.canonical_path(pid)
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        out = ohlc.copy().sort_index()
+                        out.index = out.index.tz_convert("UTC")
+                        out = out.reset_index().rename(columns={"index": "timestamp"})
+                        out["timestamp"] = out["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                        out.to_csv(path, index=False)
+                        logger.info(f"[TopMovers] Bootstrapped OHLC for {pid} -> {path}")
+            except Exception as e:
+                logger.warning(f"[TopMovers] Bootstrap backfill failed for {pid}: {e}")
+
+    async def _apply_changes(self, to_add: list[str], to_remove: list[str]):
+        max_change = max(1, self.cfg.max_changes_per_cycle)
+        to_add = [p for p in to_add if self._cooldown_ok(p)][:max_change]
+        to_remove = [p for p in to_remove if self._cooldown_ok(p)][:max_change]
+
+        if not to_add and not to_remove:
+            return
+
+        await self._bootstrap_new(to_add)
+
+        for ch in self.channels_to_manage:
+            if to_add:
+                await _safe_add_subscription(self.ws, ch, to_add)
+            if to_remove:
+                await _safe_remove_subscription(self.ws, ch, to_remove)
+
+        for p in to_add:
+            self.current.add(p); self.last_action_at[p] = self._now()
+        for p in to_remove:
+            if p in self.current and p not in self.sticky:
+                self.current.remove(p); self.last_action_at[p] = self._now()
+
+        logger.info(f"[TopMovers] add={to_add} remove={to_remove} current={sorted(self.current)}")
+
+    async def run(self):
+        first_run = True
+        while True:
+            try:
+                ranked = self._rank_desired()
+                desired = self._apply_hysteresis(ranked)
+
+                if len(desired) > self.cfg.top_movers_count:
+                    overflow = len(desired) - self.cfg.top_movers_count
+                    rank_map = {pid: i for i, pid in enumerate(ranked)}
+                    non_sticky_sorted = sorted([p for p in desired if p not in self.sticky],
+                                               key=lambda p: rank_map.get(p, 1_000_000))
+                    for p in reversed(non_sticky_sorted[-overflow:]):
+                        desired.discard(p)
+
+                to_add = sorted(list(desired - self.current))
+                to_remove = sorted([p for p in (self.current - desired) if p not in self.sticky])
+
+                if first_run and self.sticky:
+                    for ch in self.channels_to_manage:
+                        await _safe_add_subscription(self.ws, ch, sorted(self.sticky))
+                    self.current |= set(self.sticky)
+                    first_run = False
+
+                await self._apply_changes(to_add, to_remove)
+
+            except Exception as e:
+                logger.warning(f"[TopMovers] Loop error: {e}")
+
+            await asyncio.sleep(self.cfg.top_movers_poll_sec)
+
+# ----------------------------------------------------------------------
+# Live pipeline: start WS + resampler + notifier + movers (background) and return ws handle
+# ----------------------------------------------------------------------
+async def start_live_pipeline(config: DataPipelineConfig) -> WebSocketListener:
+    # 1) Real-time resampler
     resampler = RealTimeOHLCResampler(freq=config.resample_freq, canonical_path_func=config.canonical_path)
 
     # 2) WebSocket listener + queue
     tick_queue: asyncio.Queue = asyncio.Queue(maxsize=10000)
-
-    # Prefer Advanced Trade URL if you didn’t explicitly override in config
     ws_listener = WebSocketListener(
         ws_url=(config.ws_url or "wss://advanced-trade-ws.coinbase.com"),
         out_queue=tick_queue,
-        top_movers_count=config.top_movers_count if hasattr(config, "top_movers_count") else 20,
+        top_movers_count=getattr(config, "top_movers_count", 20),
     )
 
-    # Start listener in the background with initial product subscriptions
+    # Start listener
     async def start_ws():
-        # For upgraded listener: pass initial subscriptions per channel; for older versions, pass product list only.
         try:
-            # Try upgraded pattern: channels + products
             initial = {ch: (config.seed_products if ch in ("ticker", "ticker_batch", "candles", "level2") else None)
-                       for ch in ["ticker", "candles", "level2", "status"]}
-            await ws_listener.run(initial_subscriptions=initial)  # type: ignore
+                       for ch in config.channels}
+            await ws_listener.run(initial_subscriptions=initial)  # upgraded variant
         except TypeError:
-            # Fallback to your older signature: a flat product list and only ticker channel
             logger.info("ws_listener.run(initial_subscriptions=...) not supported; falling back to initial_symbols.")
-            await ws_listener.run(initial_symbols=config.seed_products)  # type: ignore
+            await ws_listener.run(initial_symbols=config.seed_products)  # older variant
 
-    ws_task = asyncio.create_task(start_ws())
+    asyncio.create_task(start_ws())
 
-    # 3) Consumer routes WS messages to the resampler (expects Advanced Trade 'candles' channel)
+    # Consumer routes 'candles' frames to resampler
     async def consume():
         while True:
             msg = await tick_queue.get()
             if isinstance(msg, dict) and msg.get("channel") == "candles":
                 resampler.ingest_candles_message(msg)
-            # You can also branch 'ticker' or 'level2' here for microstructure features.
 
-    consumer_task = asyncio.create_task(consume())
+    asyncio.create_task(consume())
 
-    # 4) Notify ai_core when a new bar closes (poll canonical files)
+    # Notifier: detect new/updated bars by scanning canonical folder (handles dynamic adds)
     async def notify_new_bars():
         import pandas as pd
         last_seen: Dict[str, str] = {}
+        freq_suffix = f"_{config.resample_freq}"
+        base_dir = config.canonical_dir
         while True:
-            for product in config.seed_products:
-                path = config.canonical_path(product)
-                if not path.exists():
+            for path in base_dir.glob(f"*{freq_suffix}.csv"):
+                stem = path.stem  # e.g., "BTC-USD_1H"
+                if not stem.endswith(freq_suffix):
                     continue
+                product = stem[: -len(freq_suffix)]
                 try:
                     df = pd.read_csv(path)
                     if df.empty:
@@ -287,15 +432,18 @@ async def run_live_pipeline(config: DataPipelineConfig):
                     if last_seen.get(product) != last_ts:
                         row = df.iloc[-1].to_dict()
                         ts_iso = row.pop("timestamp")
-                        await on_new_bar(product, ts_iso, row)  # async hook into ai_core
+                        await on_new_bar(product, ts_iso, row)
                         last_seen[product] = last_ts
                 except Exception as e:
                     logger.warning(f"[Notifier] Error reading {path}: {e}")
-            await asyncio.sleep(10)  # tune based on how quickly you want signals after bar close
+            await asyncio.sleep(10)
 
-    notifier_task = asyncio.create_task(notify_new_bars())
+    asyncio.create_task(notify_new_bars())
 
-    await asyncio.gather(ws_task, consumer_task, notifier_task)
+    # Top movers coordinator
+    asyncio.create_task(TopMoversCoordinator(config, ws_listener).run())
+
+    return ws_listener
 
 # ----------------------------------------------------------------------
 # Main entry: run goals + pipeline together
@@ -303,12 +451,12 @@ async def run_live_pipeline(config: DataPipelineConfig):
 async def main():
     logger.info("🚀 Agent started.")
 
-    # 0) Load pipeline (goal_meta_data). You can externalize to a JSON/YAML later if you want.
+    # 0) Pipeline config (move to JSON/YAML later if you prefer)
     config = DataPipelineConfig(
         vs_currency="USD",
         backfill_start="2023-01-01",
-        backfill_end=None,          # None = now
-        resample_freq="1H",         # switch to "1D" if you want daily bars
+        backfill_end=None,            # None = now
+        resample_freq="1H",
         api_style="advanced_trade",
         ws_url=None,
         channels=["candles", "ticker", "level2", "status"],
@@ -316,15 +464,26 @@ async def main():
         seed_products=["BTC-USD", "ETH-USD", "SOL-USD"],
         dynamic_top_movers=True,
         top_movers_count=20,
+
+        # Top movers tuning
+        top_movers_poll_sec=30,
+        min_candidate_score=0.15,
+        freshness_sec=15*60,
+        hysteresis_margin=0.03,
+        max_changes_per_cycle=10,
+        cooldown_sec=60,
+        include_seed_products=True,
+        bootstrap_on_add=True,
+        bootstrap_lookback_days=7,
     )
 
-    # 1) Bootstrap historical (non-async, runs once)
+    # 1) Bootstrap historical (once)
     bootstrap_backfill(config, config.seed_products)
 
-    # 2) Start live data pipeline in the background
-    live_task = asyncio.create_task(run_live_pipeline(config))
+    # 2) Start live pipeline and get ws handle
+    ws_handle = await start_live_pipeline(config)
 
-    # 3) Goal loop (your original logic), now running concurrently
+    # 3) Goal loop (concurrent)
     async def goal_loop():
         while True:
             goal = get_next_pending_goal()
@@ -332,40 +491,10 @@ async def main():
                 logger.info("⏳ No pending goals. Sleeping...")
                 await asyncio.sleep(30)
                 continue
-            # We pass the ws listener object by reference—retrieved from the live task scope is complex,
-            # so for simplicity, we retain a module-global reference pattern (or refactor to share).
-            # Here, we’ll re-create a lightweight handle to the running listener by storing it on the task.
-            # Simpler approach: keep subscribe_to_tokens to operate on scraped data later via a shared queue.
-            # For now, we skip passing the live listener into solve_goal; instead, solve_goal will subscribe via a global registry.
-            # To keep your current signature, we expose a NO-OP listener object. See below for the simple adapter.
-            await solve_goal(goal, _noop_listener)
+            # FIX: goal is a dict; pass the string text
+            await solve_goal(goal["goal"], ws_handle)
 
-    # Minimal adapter to let your solve_goal() issue subscriptions without breaking
-    class _NoopListener:
-        async def add_subscription(self, channel, product_ids): pass
-        async def subscribe(self, *args, **kwargs): pass
-    _noop_listener = _NoopListener()
-
-    # NOTE:
-    # If you want solve_goal() to actually subscribe in real time, we can wire a shared reference.
-    # Easiest is to put the active ws_listener into a global registry in run_live_pipeline()
-    # and pull it here. I kept it simple and safe; happy to wire it directly if you prefer.
-
-    goal_task = asyncio.create_task(goal_loop())
-
-    await asyncio.gather(live_task, goal_task)
+    await goal_loop()  # keep running
 
 if __name__ == "__main__":
     asyncio.run(main())
- 
-
- 
-
-
- 
-
-
-
- 
-
- 
