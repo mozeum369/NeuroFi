@@ -8,6 +8,9 @@ from datetime import datetime, timezone
 import csv
 import time
 
+import pandas as pd
+import numpy as np
+
 from data_utils import cached_fetch_json, log_message, save_data_snapshot
 
 # ------------------------------------------------------------------------------
@@ -99,8 +102,6 @@ def resolve_coingecko_id(symbol_or_id: str) -> str | None:
         log_message(f"No CoinGecko match found for symbol/id '{symbol_or_id}'", level="error")
         return None
 
-    # If multiple matches (common for tickers), pick the most popular-looking by name heuristic (optional),
-    # but safest is to pick the first returned by the list (sorted by CG).
     coin_id = matches[0].get("id")
     if len(matches) > 1:
         log_message(
@@ -261,14 +262,116 @@ def save_as_csv(rows: list[dict], filename: str):
 
 
 # ------------------------------------------------------------------------------
+# OHLC Aggregation Helpers
+# ------------------------------------------------------------------------------
+
+def rows_to_dataframe(rows: list[dict]) -> pd.DataFrame:
+    """
+    Convert normalized rows into a UTC-indexed DataFrame with columns: price, volume.
+    Uses 'price_usd' and 'total_volume_usd' from normalize_market_chart_to_rows().
+    """
+    if not rows:
+        return pd.DataFrame(columns=["price", "volume"])
+
+    df = pd.DataFrame(rows)
+    if "timestamp_ms" not in df.columns:
+        return pd.DataFrame(columns=["price", "volume"])
+
+    # Convert timestamp_ms -> UTC DateTimeIndex
+    df["timestamp"] = pd.to_datetime(df["timestamp_ms"], unit="ms", utc=True)
+    df = df.set_index("timestamp").sort_index()
+
+    # Standardize column names
+    price_col = "price_usd" if "price_usd" in df.columns else "price"
+    vol_col = "total_volume_usd" if "total_volume_usd" in df.columns else "volume"
+
+    out = pd.DataFrame(index=df.index)
+    out["price"] = df.get(price_col, pd.Series(index=df.index, dtype=float))
+    out["volume"] = df.get(vol_col, pd.Series(index=df.index, dtype=float))
+
+    # De-duplicate any overlapping timestamps
+    out = out[~out.index.duplicated(keep="last")]
+    return out
+
+
+def aggregate_to_ohlc(price_df: pd.DataFrame, freq: str = "1H") -> pd.DataFrame:
+    """
+    Aggregate irregular price (and volume) into OHLCV at the chosen frequency.
+    - freq: '1H' (default) or '1D'
+    Returns: DataFrame with columns [open, high, low, close, volume, ret, log_ret]
+    """
+    if price_df.empty:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume", "ret", "log_ret"])
+
+    # Ensure UTC DateTimeIndex
+    idx = price_df.index
+    if not isinstance(idx, pd.DatetimeIndex):
+        raise ValueError("Input must be indexed by a pandas DatetimeIndex (UTC).")
+    if idx.tz is None:
+        price_df = price_df.tz_localize("UTC")
+    else:
+        price_df = price_df.tz_convert("UTC")
+
+    # OHLC with right-closed/right-labeled intervals
+    ohlc = price_df["price"].resample(freq, label="right", closed="right").ohlc()
+
+    # Volume per bucket
+    if "volume" in price_df.columns:
+        vol = price_df["volume"].resample(freq, label="right", closed="right").sum(min_count=1)
+        ohlc["volume"] = vol
+    else:
+        ohlc["volume"] = np.nan
+
+    # Returns
+    ohlc["ret"] = ohlc["close"].pct_change()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = ohlc["close"] / ohlc["close"].shift(1)
+        ohlc["log_ret"] = np.log(ratio.replace({0: np.nan}))
+
+    # Drop bars where OHLC are all NaN
+    ohlc = ohlc.dropna(subset=["open", "high", "low", "close"], how="all")
+    return ohlc
+
+
+def save_ohlc_csv(ohlc: pd.DataFrame, filename_base: str, freq: str = "1H"):
+    """
+    Save OHLC DataFrame to ai_core/data/ohlc/{filename_base}_ohlc_{freq}.csv
+    """
+    out_dir = DATA_DIR / "ohlc"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    out = ohlc.copy()
+    out = out.sort_index()
+    out.index = out.index.tz_convert("UTC")
+    out = out.reset_index().rename(columns={"index": "timestamp"})
+    out["timestamp"] = out["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    csv_path = out_dir / f"{filename_base}_ohlc_{freq.upper()}.csv"
+    out.to_csv(csv_path, index=False)
+    log_message(f"Saved OHLC CSV to {csv_path}")
+
+
+# ------------------------------------------------------------------------------
 # CLI / Script Entrypoint
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Example usage: pull 2023 for BTC-USD
-    symbol = "BTC"        # Accepts 'BTC' or 'bitcoin' or 'BTC-USD'
-    currency = "USD"
-    start_date = "2023-01-01"
-    end_date = "2023-12-31"
+    import argparse
+
+    parser = argparse.ArgumentParser(description="CoinGecko market_chart/range fetch + OHLC aggregation")
+    parser.add_argument("--symbol", default="BTC", help="Symbol or CoinGecko id (e.g., BTC or bitcoin)")
+    parser.add_argument("--currency", default="USD", help="Quote currency (default: USD)")
+    parser.add_argument("--start", default="2023-01-01", help="Start date YYYY-MM-DD")
+    parser.add_argument("--end", default="2023-12-31", help="End date YYYY-MM-DD")
+    parser.add_argument("--freq", default="1H", help="Resample frequency: 1H or 1D (default: 1H)")
+    parser.add_argument("--skip-normalized", action="store_true", help="Skip saving normalized CSV")
+    parser.add_argument("--skip-ohlc", action="store_true", help="Skip saving OHLC CSV")
+    args = parser.parse_args()
+
+    symbol = args.symbol
+    currency = args.currency
+    start_date = args.start
+    end_date = args.end
+    freq = args.freq.upper()
 
     filename_base = f"{symbol}_{currency}_{start_date}_to_{end_date}".replace("-", "")
 
@@ -279,4 +382,17 @@ if __name__ == "__main__":
 
         # CSV (normalized)
         rows = normalize_market_chart_to_rows(raw)
-        save_as_csv(rows, filename_base)
+        if rows and not args.skip_normalized:
+            save_as_csv(rows, filename_base)
+
+        # OHLC aggregation
+        if rows and not args.skip_ohlc:
+            df = rows_to_dataframe(rows)
+            ohlc = aggregate_to_ohlc(df, freq=freq)
+            if not ohlc.empty:
+                save_ohlc_csv(ohlc, filename_base, freq=freq)
+            else:
+                log_message("OHLC aggregation produced no rows (check date range and symbol).", level="warning")
+    else:
+        log_message("No raw data returned; nothing to save.", level="error")
+ 
