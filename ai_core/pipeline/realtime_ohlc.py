@@ -45,7 +45,6 @@ class RealTimeOHLCResampler:
             "close": "last",
             "volume": "sum"
         })
-
         ohlc["ret"] = ohlc["close"].pct_change()
         with np.errstate(divide="ignore", invalid="ignore"):
             ratio = ohlc["close"] / ohlc["close"].shift(1)
@@ -60,7 +59,7 @@ class RealTimeOHLCResampler:
         for ev in events:
             for c in ev.get("candles", []):
                 try:
-                    product = c["product_id"]
+                    import pandas as pd
                     ts = pd.to_datetime(int(c["start"]), unit="s", utc=True)
                     row = {
                         "timestamp": ts,
@@ -70,19 +69,20 @@ class RealTimeOHLCResampler:
                         "close": float(c["close"]),
                         "volume": float(c["volume"]),
                     }
+                    pid = c["product_id"]
                 except Exception as e:
                     log_message(f"[RT-OHLC] Malformed candle: {e}", level="warning")
                     continue
-
-                self.buffers.setdefault(product, []).append(row)
+                self.buffers.setdefault(pid, []).append(row)
                 need = 12 if self.freq == "1H" else 288
-                if len(self.buffers[product]) >= need:
-                    self._flush_product(product)
+                if len(self.buffers[pid]) >= need:
+                    self._flush_product(pid)
 
     def _flush_product(self, product_id: str):
         buf = self.buffers.get(product_id, [])
         if not buf:
             return
+        import pandas as pd
         df5 = pd.DataFrame(buf).drop_duplicates(subset=["timestamp"]).set_index("timestamp").sort_index()
 
         path = self.get_path(product_id)
@@ -107,6 +107,5 @@ class RealTimeOHLCResampler:
 
         self._save_canonical(merged, path)
 
-        # Trim buffer window (keep last day for 1H, last week for 1D)
         keep_from = merged.index.max() - (pd.Timedelta(days=1) if self.freq == "1H" else pd.Timedelta(days=7))
         self.buffers[product_id] = [r for r in buf if r["timestamp"] >= keep_from]
